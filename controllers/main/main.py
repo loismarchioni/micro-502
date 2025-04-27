@@ -745,6 +745,10 @@ if __name__ == '__main__':
                 drone.dt_ctrl = drone.getTime() - drone.PID_update_last_time # Time interval for PID control - Is refactored above for KF - why done twice?
                 drone.PID_update_last_time = drone.getTime()
 
+
+            ### show image here
+
+
             # Update the drone status in simulation
             drone.step(motorPower, sensor_data)
     

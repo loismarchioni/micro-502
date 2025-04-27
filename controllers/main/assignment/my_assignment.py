@@ -28,29 +28,173 @@ import cv2
 
 class GateTracker:
     def __init__(self):
-        self.phase = 0                      # 0: store 1st frame, 1: 2nd frame + triangulation
-        self.detected_gates = []            # estimated poses of each gate (x, y, z, yaw)
-        self.gate_index = 0                 # current gate index. index = 0,...,4.
-        self.gate_passed = False            # flag for passing gate
+        self.state = 0                          # 0: store 1st frame, 1: 2nd frame + triangulation
+        self.detected_gates = []                # estimated poses of each gate [x, y, z]
+        self.gate_index = 0                     # current gate index. index = 0,...,4
+        self.gate_passed = False                # flag for passing gate
+        
+        self.possible_gate_centers = []         # detected gate center(s) [(cx1, cy1), ...]
+        self.prev_sensor = None                 # sensor data [x, y, z, yaw, qx, qy, qz, qw]
+        self.avg_distance = 0                   # average distance to the gate
+        self.cntr = 0                           # general counter
+        self.cntr2 = 0                          # general counter
+        self.estimated_gate_pose = None         # estimated pose of targeted gate [x, y, z]
+        self.nb_triang = 0                      # nb of triangulations
 
-        self.prev_gate_center = None        # center coord of first frame (cx, cy)
-        self.prev_pose = None               # drone's pose at first frame (x, y, z, yaw)
-        self.estimated_gate_pose = None     # estimated pose of targeted gate (x, y, z, yaw)
 
-    
-
-    def current_gate_center(camera):
+    ## PUBLIC METHODS    
+    def get_command_from_triangulation(self, sensor_data, camera_data, Verbose=False):
         """
         @ pars
+        - sensor_data : Data from sensors.
         - camera : np.array of size (300, 300, 4). Current camera image in BGRA format.
-
+        - Verbose : bool. Allows to display debug info.
         @ return
-        - c : tuple (cx, cy). Center of the gate in the camera frame.
-
+        - control_command : list [x,y,z,yaw]. Setpoint command.
         ---
         @ brief
-        - Compute the coordonates of the center of the current targeted gate in the camera frame.
+        - Compute and return the pose of the targeted gate.
         """
+
+        ## gate tracking FSM
+        NB_MAX_TRIANG   = 4
+        YAW_VAR         = np.deg2rad(15)
+        YAW_VAR_THRESH  = np.deg2rad(2)
+        FORWARD_CNTR    = 60
+        FORWARD_COEFF   = 0.05
+        ALTITUDE_CNTR   = 200
+        ALTITUDE_THRESH = 0.7
+        DISTANCE_THRESH = 1e-1
+
+        # STATE 0 : 1st frame
+        if self.state == 0:         
+            if Verbose: print("phase 0")
+
+            self.possible_gate_centers = [self.__find_gate_center(camera_data)]
+            if self.possible_gate_centers[0] is None:
+                self.state = 2
+            else:
+                self.state = 3
+            
+            self.prev_sensor = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw'],
+                                sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
+
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
+            return control_command
+        
+
+        # STATE 1 : 2nd frame + triangulate
+        elif self.state == 1:       
+            if Verbose: print("phase 1")
+
+            self.nb_triang += 1
+
+            curr_sensor = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw'],
+                           sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
+            curr_gate_centers = [self.__find_gate_center(camera_data)]    # might have multiple centers
+
+            if curr_gate_centers[0] is None or len(curr_gate_centers) != len(self.possible_gate_centers):
+                self.state = 0
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
+                return control_command
+
+            # triangulate all possible gate centers
+            for i,c in enumerate(self.possible_gate_centers):
+                estimated_center = self.__triangulate_gate(self.prev_sensor, c, curr_sensor, curr_gate_centers[i])
+            
+                # identify correct center knowing the targeted gate's region
+                if self.__in_correct_sector(estimated_center):
+                    self.estimated_gate_pose = estimated_center
+                    break
+            
+            if self.estimated_gate_pose is None:
+                self.state = 0
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
+                return control_command
+            
+            print("estimated : " + str(self.estimated_gate_pose))
+            print("current : " + str(curr_sensor[0:3]))
+            # store current data for next triangulation
+            self.prev_sensor = curr_sensor
+            self.possible_gate_centers = curr_gate_centers
+
+            # move a bit before performing next triangulation
+            self.state = 3
+
+
+            control_command = self.estimated_gate_pose.tolist() + [sensor_data['yaw']]
+            return control_command
+        
+
+        # STATE 2 : turn YAW_VAR [rad] toward next region if no gate in frame
+        elif self.state == 2:       
+            if Verbose: print("phase 2")
+
+            if abs(sensor_data['yaw'] - (self.prev_sensor[3] + YAW_VAR)) < YAW_VAR_THRESH:
+                self.state = 0
+
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, self.prev_sensor[3] + YAW_VAR]
+            return control_command
+
+        
+        # SATTE 3 : move toward setpoint
+        elif self.state == 3:       
+            if Verbose: print("phase 3")
+
+            self.cntr += 1
+            if self.cntr >= FORWARD_CNTR:
+                if self.nb_triang <= NB_MAX_TRIANG:
+                    self.state = 1
+                self.cntr = 0
+
+            if self.estimated_gate_pose is None:    # move forward
+                control_command = [sensor_data['x_global'] + FORWARD_COEFF*np.cos(-sensor_data['yaw']),
+                                sensor_data['y_global'] - FORWARD_COEFF*np.sin(-sensor_data['yaw']),
+                                sensor_data['z_global'], sensor_data['yaw']]
+            
+            else:                                   # move toward gate
+                # correct yaw to point toward gate
+                corr_yaw = np.arctan2((self.estimated_gate_pose[1] - sensor_data['y_global']),
+                                       (self.estimated_gate_pose[0] - sensor_data['x_global']))
+                
+                # correct only altitude if dz is too important
+                if abs(self.estimated_gate_pose[2] - sensor_data['z_global']) > ALTITUDE_THRESH:
+                    self.state = 4
+
+                distance_to_gate = np.linalg.norm(self.estimated_gate_pose - (sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']))
+                print("distance : " + str(distance_to_gate))
+                if distance_to_gate < DISTANCE_THRESH:
+                    self.state = None
+
+                control_command = self.estimated_gate_pose.tolist() + [corr_yaw]
+
+            return control_command
+
+
+        # STATE 4 : correct altitude
+        elif self.state == 4:
+            if Verbose: print("phase 4")
+
+            self.cntr += 1
+            if self.cntr >= ALTITUDE_CNTR:
+                if self.nb_triang <= NB_MAX_TRIANG:
+                    self.state = 1
+                self.cntr = 0
+
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], self.estimated_gate_pose[2], sensor_data['yaw']]
+            return control_command
+
+
+        # STATE DEFAULT
+        else:                       
+            if Verbose: print("phase default")
+
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
+            return control_command
+        
+
+    ## PRIVATE METHODS
+    def __find_gate_center(self, camera):
 
         ## extract magenta region
         image_BGR = camera[:, :, :3]
@@ -64,64 +208,113 @@ class GateTracker:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
 
-        ## extract largest contour
+        ## extract center of contour(s)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-        largest_cnt = None
-        largest_area = 0
 
+        if len(contours) == 0:    # no gate detected in the frame
+            self.state = 2
+            return None
+        
+        centers = []
         for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area > largest_area:
-                largest_cnt = cnt   # largest contour
-                largest_area = area
+            # compute centroid(s)
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                M["m00"] = 1e-6
 
-
-        ## compute centroid of largest contour
-        M = cv2.moments(largest_cnt)
-        if M["m00"] == 0:
-            M["m00"] = 1e-6
-
-        c = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-
+            c = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+            centers.append(c)
+    
         return c
     
 
-    def get_command_from_triangulation(self, sensor_data, camera_data):
-        """
-        @ pars
-        - camera : np.array of size (300, 300, 4). Current camera image in BGRA format.
 
-        @ return
-        - 
+    def __triangulate_gate(self, prev_sensor, prev_center, curr_sensor, curr_center):
 
-        ---
-        @ brief
-        - 
-        """
+        # intrinsic pars and misc
+        FOCAL_LENGTH    = 161.013922282                     # focal lentgh in pixels.
+        (WIDTH, HEIGHT) = (300, 300)                        # size of image in pixels.
+        CAMERA_OFFSET   = np.array([0.03, 0.0, 0.01])       # camera position offset wrt the drone.
+        R_cam_to_drone  = np.array([[0,  0, 1],             # Rotation matrix from camera frame to drone frame.
+                                    [-1, 0, 0],
+                                    [0, -1, 0]])
 
-        # gate tracking FSM
-        if self.phase == 0:         # 1st frame
-            self.prev_gate_center = self.current_gate_center(camera_data)
-            self.prev_pose = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
-            self.phase = 1
+        # nested functions
+        def pixel_to_camera_vector(center):
+            uc     = center[0] - 0.5*WIDTH
+            vc     = center[1] - 0.5*HEIGHT
 
-            d = 0.02    # [m]
-            control_command = [sensor_data['x_global'] + d*np.sin(-sensor_data['yaw']),
-                               sensor_data['y_global'] + d*np.cos(-sensor_data['yaw']),
-                               sensor_data['z_global'], sensor_data['yaw']]
-            return control_command
-
-        elif self.phase == 2:       # 2nd frame + triangulate
-
-            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
-            return control_command
-        else:                       # default case
-
-            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
-            return control_command
+            return np.array([uc, vc, FOCAL_LENGTH])
         
+        def get_camera_to_world_vector(center, sensor):
+            v_cam   = pixel_to_camera_vector(center)
+            v_drone = R_cam_to_drone @ v_cam
+            Rbw     = rotation_matrix_from_quaternion(sensor[4], sensor[5], sensor[6], sensor[7])
 
+            return Rbw @ v_drone
+        
+        def get_camera_position(sensor):
+            pos_drone = np.array([sensor[0], sensor[1], sensor[2]])
+            Rq        = rotation_matrix_from_quaternion(sensor[4], sensor[5], sensor[6], sensor[7])
+
+            return pos_drone + Rq @ CAMERA_OFFSET
+        
+        def rotation_matrix_from_quaternion(qx, qy, qz, qw):
+            norm = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+            qx, qy, qz, qw = qx/norm, qy/norm, qz/norm, qw/norm
+
+            xx, yy, zz = qx*qx, qy*qy, qz*qz
+            xy, xz, yz = qx*qy, qx*qz, qy*qz
+            wx, wy, wz = qw*qx, qw*qy, qw*qz
+
+            R = np.array([[1 - 2*(yy + zz),   2*(xy - wz),       2*(xz + wy)],
+                          [2*(xy + wz),       1 - 2*(xx + zz),   2*(yz - wx)],
+                          [2*(xz - wy),       2*(yz + wx),       1 - 2*(xx + yy)]])
+            
+            return R
+
+
+        # vectors and camera centers
+        r = get_camera_to_world_vector(prev_center, prev_sensor)
+        s = get_camera_to_world_vector(curr_center, curr_sensor)
+        P = get_camera_position(prev_sensor)
+        Q = get_camera_position(curr_sensor)
+
+        # solve (least squares)
+        rr = r @ r
+        rs = r @ s
+        ss = s @ s
+        b1 = (Q - P) @ r
+        b2 = (Q - P) @ s
+        A  = np.array([[ rr, -rs],
+                    [ rs, -ss]])
+        b  = np.array([b1, b2])
+
+        try:
+            lam, mu = np.linalg.lstsq(A, b, rcond=None)[0]
+        except np.linalg.LinAlgError:
+            lam, mu = 1.0, 1.0
+
+        F = P + lam*r
+        G = Q + mu*s
+        H = 0.5*(F + G)     # position [x,y,z]
+
+        return H
+
+
+    def __in_correct_sector(self, position):
+        (CX, CY) = (4.0, 4.0)       # center of wolrd frame area
+        
+        x     = position[0] - CX
+        y     = position[1] - CY
+        theta = np.arctan2(y, x)    # angle from center of world frame
+
+        return (np.rad2deg(theta) > self.gate_index*60 - 150 and np.rad2deg(theta) < (self.gate_index + 1)*60 - 150)
+
+
+####################################
+# --- MAIN ASSIGNMENT FUNCTION --- #
+####################################
 
 def get_command(sensor_data, camera_data, dt):
 
@@ -129,24 +322,17 @@ def get_command(sensor_data, camera_data, dt):
     # If you want to display the camera image you can call it main.py.
 
     # Take off example
-
-    segments_yaws = [np.deg2rad(-90),   # toward origin
-                        np.deg2rad(-45),   # toward gate 1 region
-                        np.deg2rad(15),    # toward gate 2 region
-                        np.deg2rad(75),    # toward gate 3 region
-                        np.deg2rad(135),   # toward gate 4 region
-                        np.deg2rad(195),]  # toward gate 5 region
     
-    if sensor_data['z_global'] < 0.49:
-        control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, segments_yaws[1]]
-        return control_command
+    # if sensor_data['z_global'] < 0.49:
+    #     control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, segments_yaws[1]]
+    #     return control_command
 
     # ---- YOUR CODE HERE ----
 
 
     # ---- GENERAL INFOS ----
 
-    # control_command : [x, y, z, yaw] in the inertial reference frame
+    # control_command : <list> [x, y, z, yaw] in the inertial reference frame
     # sensor_data : <dictionnary>. Available ground truth state measurements
     # camera_data : <np.array> of size (300, 300, 4). Image im BGRA format, A=alpha is for opacity of the pixel. Pixel datatype is np.uint8. 
     # dt : elapsed time [s] since last call for the planner.
@@ -155,21 +341,31 @@ def get_command(sensor_data, camera_data, dt):
     # ---- FUNCTION ATTRIBUTES ----
     if not hasattr(get_command, "initialized"):     # done at first call to initialize internal FSM
         get_command.initialized = True
-        get_command.state = "TRACKING"
+        get_command.state = "TAKE_OFF"
         get_command.tracker = GateTracker()
-        get_command.racer = None
+        get_command.racer = None                    # class to be defined
 
 
     # ---- TAKE OFF ----
+    if get_command.state == "TAKE_OFF":
 
+        if sensor_data['z_global'] < 0.49:
+            # take-off
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
+
+            return control_command
+        
+        else:
+            get_command.state = "DETECTION"
 
 
     # ---- 1st LAP : GATES DETECTION ----
-    if get_command.state == "TRACKING":
+    if get_command.state == "DETECTION":
         
-        control_command = get_command.tracker.get_command_from_triangulation(sensor_data, camera_data)
 
-        # control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, segments_yaws[1]]
+        control_command = get_command.tracker.get_command_from_triangulation(sensor_data, camera_data, Verbose=True)
+
+        # control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
         return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
 
 
