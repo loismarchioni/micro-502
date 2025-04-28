@@ -31,19 +31,17 @@ class GateTracker:
         self.state = 0                          # 0: store 1st frame, 1: 2nd frame + triangulation
         self.detected_gates = []                # estimated poses of each gate [x, y, z]
         self.gate_index = 0                     # current gate index. index = 0,...,4
-        self.gate_passed = False                # flag for passing gate
         
         self.possible_gate_corners = []         # detected gate corners list of np.array
         self.prev_sensor = None                 # sensor data [x, y, z, yaw, qx, qy, qz, qw]
         self.avg_distance = 0                   # average distance to the gate
         self.cntr = 0                           # general counter
-        self.cntr2 = 0                          # general counter
         self.estimated_gate_pose = None         # estimated pose of targeted gate [x, y, z]
         self.nb_triang = 0                      # nb of triangulations
 
 
     ## PUBLIC METHODS    
-    def get_command_from_triangulation(self, sensor_data, camera_data, Verbose=False):
+    def get_command_1st_lap(self, sensor_data, camera_data, get_command_ref, Verbose=False):
         """
         @ pars
         - sensor_data : Data from sensors.
@@ -53,18 +51,21 @@ class GateTracker:
         - control_command : list [x,y,z,yaw]. Setpoint command.
         ---
         @ brief
-        - Compute and return the pose of the targeted gate.
+        - Compute and return the control command to perform the 1st lap.
         """
 
         ## gate tracking FSM
-        NB_MAX_TRIANG   = 2
+        # constant pars
+        NB_MAX_TRIANG   = 4
         YAW_VAR         = np.deg2rad(30)
         YAW_VAR_THRESH  = np.deg2rad(2)
         FORWARD_CNTR    = 60
         FORWARD_COEFF   = 0.05
         ALTITUDE_CNTR   = 200
+        ALTITUDE_CNTR2  = 100
         ALTITUDE_THRESH = 0.7
         DISTANCE_THRESH = 1e-1
+        BASE_POSE       = [1.0, 4.0, 0.1]
 
         # STATE 0 : 1st frame
         if self.state == 0:         
@@ -92,7 +93,6 @@ class GateTracker:
             curr_sensor = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw'],
                            sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
             curr_gate_corners = self.__find_gate_corners(camera_data)
-            print(curr_gate_corners)
 
             if curr_gate_corners is None or len(curr_gate_corners) != len(self.possible_gate_corners):
                 self.nb_triang -= 1
@@ -104,19 +104,12 @@ class GateTracker:
             for i,corners in enumerate(self.possible_gate_corners):
 
                 # triangulate corners set and compute center
-                print("prev coord : " + str(corners))
-                print("curr coord : " + str(curr_gate_corners[i]))
                 if corners.shape != curr_gate_corners[i].shape:
                     continue
 
                 estimated_corners = []
                 for j, coords in enumerate(corners):
                     estimated_corners.append(self.__triangulate_gate(self.prev_sensor, coords, curr_sensor, curr_gate_corners[i][j]))
-
-                # if len(estimated_corners) == 0:
-                #     self.state = 0
-                #     control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
-                #     return control_command
                 
                 estimated_center = np.mean(estimated_corners, axis=0)
 
@@ -126,21 +119,19 @@ class GateTracker:
                     break
                     
                 # no correct center found
+
             
             if self.estimated_gate_pose is None:
                 self.state = 0
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
                 return control_command
             
-            print("estimated : " + str(self.estimated_gate_pose))
-            print("current : " + str(curr_sensor[0:3]))
             # store current data for next triangulation
             self.prev_sensor = curr_sensor
             self.possible_gate_corners = curr_gate_corners
 
             # move a bit before performing next triangulation
             self.state = 3
-
 
             control_command = self.estimated_gate_pose.tolist() + [sensor_data['yaw']]
             return control_command
@@ -150,15 +141,26 @@ class GateTracker:
         elif self.state == 2:       
             if Verbose: print("phase 2")
 
-            if abs(sensor_data['yaw'] - (self.prev_sensor[3] + YAW_VAR)) < YAW_VAR_THRESH:
-                self.state = 0
-
+            # avoid reaching ground
             if sensor_data['z_global'] < 0.5:
                 z = 0.7
             else:
                 z = sensor_data['z_global']
+            
+            # compute yaw difference
+            ref      = self.prev_sensor[3] + YAW_VAR
+            curr     = sensor_data['yaw']
+            diff     = curr - ref
+            diff_mod = (diff + np.pi)%(2*np.pi) - np.pi
 
-            control_command = [sensor_data['x_global'], sensor_data['y_global'], z, self.prev_sensor[3] + YAW_VAR]
+            if abs(diff_mod) < YAW_VAR_THRESH:
+                self.state = 0
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], z, sensor_data['yaw']]
+            else:
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], z, self.prev_sensor[3] + YAW_VAR]
+                # print("prev_data   yaw: %.3f" %self.prev_sensor[3])
+                # print("curr_sensor yaw: %.3f" %sensor_data['yaw'])
+
             return control_command
 
         
@@ -166,23 +168,27 @@ class GateTracker:
         elif self.state == 3:       
             if Verbose: print("phase 3")
 
-            print('nb triang : %d' %self.nb_triang)
-        
             self.cntr += 1
             if self.cntr >= FORWARD_CNTR:
                 if self.nb_triang <= NB_MAX_TRIANG:
                     self.state = 1
                 self.cntr = 0
 
-            if self.estimated_gate_pose is None:    # move forward
+            # move forward
+            if self.estimated_gate_pose is None:
                 control_command = [sensor_data['x_global'] + FORWARD_COEFF*np.cos(-sensor_data['yaw']),
                                 sensor_data['y_global'] - FORWARD_COEFF*np.sin(-sensor_data['yaw']),
                                 sensor_data['z_global'], sensor_data['yaw']]
-            
-            else:                                   # move toward gate
+
+                if self.nb_triang >= NB_MAX_TRIANG:
+                    self.nb_triang = 0
+                    self.state = 0
+
+            # move toward gate
+            else:                                   
                 # correct yaw to point toward gate
                 corr_yaw = np.arctan2((self.estimated_gate_pose[1] - sensor_data['y_global']),
-                                       (self.estimated_gate_pose[0] - sensor_data['x_global']))
+                                      (self.estimated_gate_pose[0] - sensor_data['x_global']))
                 
                 # correct only altitude if dz is too important
                 if abs(self.estimated_gate_pose[2] - sensor_data['z_global']) > ALTITUDE_THRESH:
@@ -190,12 +196,13 @@ class GateTracker:
 
                 # XY distance
                 distance_to_gate = np.linalg.norm(self.estimated_gate_pose[0:2] - (sensor_data['x_global'], sensor_data['y_global']))
-                print("distance : " + str(distance_to_gate))
-                if distance_to_gate < DISTANCE_THRESH:
-                    # self.state = 5
-                    self.state = None
 
-                control_command = self.estimated_gate_pose.tolist() + [corr_yaw]
+                if distance_to_gate < DISTANCE_THRESH:  # estimated gate pose reached
+                    self.__store_gate_and_reset()
+                    control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
+
+                else:
+                    control_command = self.estimated_gate_pose.tolist() + [corr_yaw]
 
             return control_command
 
@@ -214,25 +221,39 @@ class GateTracker:
             return control_command
 
 
-        # STATE 5 : store gate and update for next gate
+        # STATE 5 : reset altitude after passing a gate
         elif self.state == 5:
             if Verbose: print("phase 5")
 
-            self.detected_gates.append(self.estimated_gate_pose)
+            self.cntr += 1
+            if self.cntr >= ALTITUDE_CNTR2:
+                self.state = 0
+                self.cntr = 0
 
-            # update gate and pars
-            self.cntr = 0
-            self.cntr2 = 0
-            self.estimated_gate_pose = None
-            self.possible_gate_corners = []
-            self.prev_sensor = None
-            self.nb_triang = 0
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
+            return control_command
 
-            self.gate_index += 1
 
-            self.state = 0
+        # STATE 6 : all gates detected, go back to base
+        elif self.state == 6:
+            if Verbose: print("phase 6")
 
-            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
+
+            # XY distance
+            distance_to_base = np.linalg.norm(np.array([BASE_POSE[0], BASE_POSE[1]]) - (sensor_data['x_global'], sensor_data['y_global']))
+            if distance_to_base < DISTANCE_THRESH:
+
+                # 1st lap complete, switch to race mode
+                get_command_ref.state = "RACE"
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
+
+            else:
+                corr_yaw = np.arctan2((BASE_POSE[1] - sensor_data['y_global']),
+                                      (BASE_POSE[0] - sensor_data['x_global']))
+                
+                control_command = [BASE_POSE[0], BASE_POSE[1], 1.4, corr_yaw]
+
+
             return control_command
 
 
@@ -290,7 +311,7 @@ class GateTracker:
         
     
         return all_corners      # list of np.array of int
-    
+
 
     def __triangulate_gate(self, prev_sensor, prev_center, curr_sensor, curr_center):
 
@@ -373,6 +394,28 @@ class GateTracker:
         theta = np.arctan2(y, x)    # angle from center of world frame
 
         return (np.rad2deg(theta) > self.gate_index*60 - 140 and np.rad2deg(theta) < (self.gate_index + 1)*60 - 160)
+    
+
+    def __store_gate_and_reset(self):
+        # store gate
+        self.detected_gates.append(self.estimated_gate_pose)
+
+        # reset gate and pars
+        self.cntr = 0
+        self.estimated_gate_pose = None
+        self.possible_gate_corners = []
+        self.prev_sensor = None
+        self.nb_triang = 0
+
+        self.gate_index += 1
+
+        if self.gate_index <= 4:
+            self.state = 5
+        else:
+            self.state = 6      # all estimated gate poses reached
+
+        return
+
 
 
 ####################################
@@ -395,7 +438,7 @@ def get_command(sensor_data, camera_data, dt):
 
     # ---- GENERAL INFOS ----
 
-    # control_command : <list> [x, y, z, yaw] in the inertial reference frame
+    # control_command : <list> [x, y, z, yaw] in the inertial reference frame (in meters and radians).
     # sensor_data : <dictionnary>. Available ground truth state measurements
     # camera_data : <np.array> of size (300, 300, 4). Image im BGRA format, A=alpha is for opacity of the pixel. Pixel datatype is np.uint8. 
     # dt : elapsed time [s] since last call for the planner.
@@ -412,7 +455,7 @@ def get_command(sensor_data, camera_data, dt):
     # ---- TAKE OFF ----
     if get_command.state == "TAKE_OFF":
 
-        if sensor_data['z_global'] < 1.0:
+        if sensor_data['z_global'] < 1.2:
             # take-off
             control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
 
@@ -425,11 +468,19 @@ def get_command(sensor_data, camera_data, dt):
     # ---- 1st LAP : GATES DETECTION ----
     if get_command.state == "DETECTION":
         
-
-        control_command = get_command.tracker.get_command_from_triangulation(sensor_data, camera_data, Verbose=True)
+        control_command = get_command.tracker.get_command_1st_lap(sensor_data, camera_data, get_command, Verbose=True)
 
         # control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
-        return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
+        return control_command
+    
+
+    # ---- 2nd and 3rd LAP : RACE ----
+    elif get_command.state == "RACE":
+
+        print("racing time")
+
+        control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, sensor_data['yaw']]
+        return control_command
 
 
 
