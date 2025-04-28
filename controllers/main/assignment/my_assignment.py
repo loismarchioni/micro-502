@@ -24,11 +24,14 @@ import cv2
 # A link to further information on how to access the sensor data on the Crazyflie hardware for the hardware practical can be found here: https://www.bitcraze.io/documentation/repository/crazyflie-firmware/master/api/logs/#stateestimate
 
 
-# ---- CLASSES ----
+
+#####################
+# ---- CLASSES ---- #
+#####################
 
 class GateTracker:
     def __init__(self):
-        self.state = 0                          # 0: store 1st frame, 1: 2nd frame + triangulation
+        self.state = 0                          # states
         self.detected_gates = []                # estimated poses of each gate [x, y, z]
         self.gate_index = 0                     # current gate index. index = 0,...,4
         
@@ -46,6 +49,7 @@ class GateTracker:
         @ pars
         - sensor_data : Data from sensors.
         - camera : np.array of size (300, 300, 4). Current camera image in BGRA format.
+        - get_command_ref : main FSM function reference.
         - Verbose : bool. Allows to display debug info.
         @ return
         - control_command : list [x,y,z,yaw]. Setpoint command.
@@ -65,7 +69,7 @@ class GateTracker:
         ALTITUDE_CNTR2  = 100
         ALTITUDE_THRESH = 0.7
         DISTANCE_THRESH = 1e-1
-        BASE_POSE       = [1.0, 4.0, 0.1]
+        BASE_POSE       = [1.0, 4.0, 1.4]       # offset added in z (real Z = 0.1)
 
         # STATE 0 : 1st frame
         if self.state == 0:         
@@ -244,6 +248,7 @@ class GateTracker:
             if distance_to_base < DISTANCE_THRESH:
 
                 # 1st lap complete, switch to race mode
+                get_command_ref.racer.gate_poses = self.detected_gates + [np.array(BASE_POSE)]
                 get_command_ref.state = "RACE"
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
 
@@ -251,7 +256,7 @@ class GateTracker:
                 corr_yaw = np.arctan2((BASE_POSE[1] - sensor_data['y_global']),
                                       (BASE_POSE[0] - sensor_data['x_global']))
                 
-                control_command = [BASE_POSE[0], BASE_POSE[1], 1.4, corr_yaw]
+                control_command = BASE_POSE + [corr_yaw]
 
 
             return control_command
@@ -418,6 +423,69 @@ class GateTracker:
 
 
 
+class Racer:
+    def __init__(self):
+        self.state = 0                # states                      
+        self.gate_poses = []          # estimated poses of each 5 gate + base from 1st lap [[x, y, z], ...]
+        self.gate_count = 0           # index of target gate
+        self.lap_count = 0            # number of comleted laps
+
+    ## PUBLIC METHODS 
+    def get_command_race_laps(self, sensor_data, get_command_ref, Verbose=False):
+        """
+        @ pars
+        - sensor_data : Data from sensors.
+        - get_command_ref : main FSM function reference.
+        - Verbose : bool. Allows to display debug info.
+        @ return
+        - control_command : list [x,y,z,yaw]. Setpoint command.
+        ---
+        @ brief
+        - Compute and return the control command to perform the 2nd and 3rd laps.
+        """
+
+        # constant pars
+        DISTANCE_THRESH = 1e-1
+        MAX_GATES_INDEX = 5
+        MAX_LAPS_COUNT  = 2
+
+
+        if self.lap_count < MAX_LAPS_COUNT:
+            current_target     = self.gate_poses[self.gate_count]
+            current_pose       = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']]
+            distance_to_target = np.linalg.norm(np.array(current_target) - np.array(current_pose))
+
+            # corrected yaw
+            corr_yaw = np.arctan2((current_target[1] - sensor_data['y_global']),
+                                  (current_target[0] - sensor_data['x_global']))
+
+            if distance_to_target > DISTANCE_THRESH:
+                control_command = current_target.tolist() + [corr_yaw]
+            else:
+                self.gate_count += 1
+
+                if self.gate_count > MAX_GATES_INDEX:
+                    # update lap count
+                    self.lap_count += 1
+
+                    # reset gate count
+                    self.gate_count = 0
+
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
+        
+        else:
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
+            get_command_ref.state = "FINISH"
+
+        
+        return control_command
+
+
+    ## PRIVATE METHODS
+
+
+
+
 ####################################
 # --- MAIN ASSIGNMENT FUNCTION --- #
 ####################################
@@ -445,11 +513,11 @@ def get_command(sensor_data, camera_data, dt):
 
 
     # ---- FUNCTION ATTRIBUTES ----
-    if not hasattr(get_command, "initialized"):     # done at first call to initialize internal FSM
+    if not hasattr(get_command, "initialized"):
         get_command.initialized = True
         get_command.state = "TAKE_OFF"
         get_command.tracker = GateTracker()
-        get_command.racer = None                    # class to be defined
+        get_command.racer = Racer()
 
 
     # ---- TAKE OFF ----
@@ -468,16 +536,19 @@ def get_command(sensor_data, camera_data, dt):
     # ---- 1st LAP : GATES DETECTION ----
     if get_command.state == "DETECTION":
         
-        control_command = get_command.tracker.get_command_1st_lap(sensor_data, camera_data, get_command, Verbose=True)
-
-        # control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
+        control_command = get_command.tracker.get_command_1st_lap(sensor_data, camera_data, get_command, Verbose=False)
         return control_command
     
 
     # ---- 2nd and 3rd LAP : RACE ----
     elif get_command.state == "RACE":
 
-        print("racing time")
+        control_command = get_command.racer.get_command_race_laps(sensor_data, get_command, Verbose=False)
+        return control_command
+    
+
+    # ---- FINISH ----
+    elif get_command.state == "FINISH":
 
         control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, sensor_data['yaw']]
         return control_command
