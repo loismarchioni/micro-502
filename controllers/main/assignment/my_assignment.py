@@ -79,7 +79,7 @@ class GateTracker:
             self.prev_sensor = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw'],
                                 sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
 
-            control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
             return control_command
         
 
@@ -95,7 +95,7 @@ class GateTracker:
 
             if curr_gate_centers[0] is None or len(curr_gate_centers) != len(self.possible_gate_centers):
                 self.state = 0
-                control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
                 return control_command
 
             # triangulate all possible gate centers
@@ -106,10 +106,12 @@ class GateTracker:
                 if self.__in_correct_sector(estimated_center):
                     self.estimated_gate_pose = estimated_center
                     break
+                    
+                # no correct center found
             
             if self.estimated_gate_pose is None:
                 self.state = 0
-                control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
                 return control_command
             
             print("estimated : " + str(self.estimated_gate_pose))
@@ -133,7 +135,12 @@ class GateTracker:
             if abs(sensor_data['yaw'] - (self.prev_sensor[3] + YAW_VAR)) < YAW_VAR_THRESH:
                 self.state = 0
 
-            control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, self.prev_sensor[3] + YAW_VAR]
+            if sensor_data['z_global'] < 0.5:
+                z = 0.7
+            else:
+                z = sensor_data['z_global']
+
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], z, self.prev_sensor[3] + YAW_VAR]
             return control_command
 
         
@@ -141,6 +148,8 @@ class GateTracker:
         elif self.state == 3:       
             if Verbose: print("phase 3")
 
+            print(self.nb_triang)
+        
             self.cntr += 1
             if self.cntr >= FORWARD_CNTR:
                 if self.nb_triang <= NB_MAX_TRIANG:
@@ -161,10 +170,11 @@ class GateTracker:
                 if abs(self.estimated_gate_pose[2] - sensor_data['z_global']) > ALTITUDE_THRESH:
                     self.state = 4
 
-                distance_to_gate = np.linalg.norm(self.estimated_gate_pose - (sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']))
+                # XY distance
+                distance_to_gate = np.linalg.norm(self.estimated_gate_pose[0:2] - (sensor_data['x_global'], sensor_data['y_global']))
                 print("distance : " + str(distance_to_gate))
                 if distance_to_gate < DISTANCE_THRESH:
-                    self.state = None
+                    self.state = 5
 
                 control_command = self.estimated_gate_pose.tolist() + [corr_yaw]
 
@@ -182,6 +192,28 @@ class GateTracker:
                 self.cntr = 0
 
             control_command = [sensor_data['x_global'], sensor_data['y_global'], self.estimated_gate_pose[2], sensor_data['yaw']]
+            return control_command
+
+
+        # STATE 5 : store gate and update for next gate
+        elif self.state == 5:
+            if Verbose: print("phase 5")
+
+            self.detected_gates.append(self.estimated_gate_pose)
+
+            # update gate and pars
+            self.cntr = 0
+            self.cntr2 = 0
+            self.estimated_gate_pose = None
+            self.possible_gate_centers = []
+            self.prev_sensor = None
+            self.nb_triang = 0
+
+            self.gate_index += 1
+
+            self.state = 0
+
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
             return control_command
 
 
@@ -349,7 +381,7 @@ def get_command(sensor_data, camera_data, dt):
     # ---- TAKE OFF ----
     if get_command.state == "TAKE_OFF":
 
-        if sensor_data['z_global'] < 0.49:
+        if sensor_data['z_global'] < 1.0:
             # take-off
             control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.4, sensor_data['yaw']]
 
