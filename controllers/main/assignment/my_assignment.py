@@ -33,7 +33,7 @@ class GateTracker:
         self.gate_index = 0                     # current gate index. index = 0,...,4
         self.gate_passed = False                # flag for passing gate
         
-        self.possible_gate_centers = []         # detected gate center(s) [(cx1, cy1), ...]
+        self.possible_gate_corners = []         # detected gate corners list of np.array
         self.prev_sensor = None                 # sensor data [x, y, z, yaw, qx, qy, qz, qw]
         self.avg_distance = 0                   # average distance to the gate
         self.cntr = 0                           # general counter
@@ -57,8 +57,8 @@ class GateTracker:
         """
 
         ## gate tracking FSM
-        NB_MAX_TRIANG   = 4
-        YAW_VAR         = np.deg2rad(15)
+        NB_MAX_TRIANG   = 2
+        YAW_VAR         = np.deg2rad(30)
         YAW_VAR_THRESH  = np.deg2rad(2)
         FORWARD_CNTR    = 60
         FORWARD_COEFF   = 0.05
@@ -70,8 +70,8 @@ class GateTracker:
         if self.state == 0:         
             if Verbose: print("phase 0")
 
-            self.possible_gate_centers = [self.__find_gate_center(camera_data)]
-            if self.possible_gate_centers[0] is None:
+            self.possible_gate_corners = self.__find_gate_corners(camera_data)
+            if self.possible_gate_corners is None:
                 self.state = 2
             else:
                 self.state = 3
@@ -91,17 +91,35 @@ class GateTracker:
 
             curr_sensor = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw'],
                            sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
-            curr_gate_centers = [self.__find_gate_center(camera_data)]    # might have multiple centers
+            curr_gate_corners = self.__find_gate_corners(camera_data)
+            print(curr_gate_corners)
 
-            if curr_gate_centers[0] is None or len(curr_gate_centers) != len(self.possible_gate_centers):
+            if curr_gate_corners is None or len(curr_gate_corners) != len(self.possible_gate_corners):
+                self.nb_triang -= 1
                 self.state = 0
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
                 return control_command
 
-            # triangulate all possible gate centers
-            for i,c in enumerate(self.possible_gate_centers):
-                estimated_center = self.__triangulate_gate(self.prev_sensor, c, curr_sensor, curr_gate_centers[i])
-            
+            # triangulate all possible gate corners sets
+            for i,corners in enumerate(self.possible_gate_corners):
+
+                # triangulate corners set and compute center
+                print("prev coord : " + str(corners))
+                print("curr coord : " + str(curr_gate_corners[i]))
+                if corners.shape != curr_gate_corners[i].shape:
+                    continue
+
+                estimated_corners = []
+                for j, coords in enumerate(corners):
+                    estimated_corners.append(self.__triangulate_gate(self.prev_sensor, coords, curr_sensor, curr_gate_corners[i][j]))
+
+                # if len(estimated_corners) == 0:
+                #     self.state = 0
+                #     control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
+                #     return control_command
+                
+                estimated_center = np.mean(estimated_corners, axis=0)
+
                 # identify correct center knowing the targeted gate's region
                 if self.__in_correct_sector(estimated_center):
                     self.estimated_gate_pose = estimated_center
@@ -118,7 +136,7 @@ class GateTracker:
             print("current : " + str(curr_sensor[0:3]))
             # store current data for next triangulation
             self.prev_sensor = curr_sensor
-            self.possible_gate_centers = curr_gate_centers
+            self.possible_gate_corners = curr_gate_corners
 
             # move a bit before performing next triangulation
             self.state = 3
@@ -148,7 +166,7 @@ class GateTracker:
         elif self.state == 3:       
             if Verbose: print("phase 3")
 
-            print(self.nb_triang)
+            print('nb triang : %d' %self.nb_triang)
         
             self.cntr += 1
             if self.cntr >= FORWARD_CNTR:
@@ -174,7 +192,8 @@ class GateTracker:
                 distance_to_gate = np.linalg.norm(self.estimated_gate_pose[0:2] - (sensor_data['x_global'], sensor_data['y_global']))
                 print("distance : " + str(distance_to_gate))
                 if distance_to_gate < DISTANCE_THRESH:
-                    self.state = 5
+                    # self.state = 5
+                    self.state = None
 
                 control_command = self.estimated_gate_pose.tolist() + [corr_yaw]
 
@@ -205,7 +224,7 @@ class GateTracker:
             self.cntr = 0
             self.cntr2 = 0
             self.estimated_gate_pose = None
-            self.possible_gate_centers = []
+            self.possible_gate_corners = []
             self.prev_sensor = None
             self.nb_triang = 0
 
@@ -226,7 +245,7 @@ class GateTracker:
         
 
     ## PRIVATE METHODS
-    def __find_gate_center(self, camera):
+    def __find_gate_corners(self, camera):
 
         ## extract magenta region
         image_BGR = camera[:, :, :3]
@@ -247,19 +266,31 @@ class GateTracker:
             self.state = 2
             return None
         
-        centers = []
-        for cnt in contours:
-            # compute centroid(s)
-            M = cv2.moments(cnt)
-            if M["m00"] == 0:
-                M["m00"] = 1e-6
+        all_corners = []
+        for contour in contours:
+            epsilon = 0.05 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
 
-            c = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-            centers.append(c)
-    
-        return c
-    
+            # corner points
+            corners = approx.reshape(-1, 2)
 
+            # order corners (NO, NE, SE, SO)
+            if corners.shape == (4,2):
+                corners = sorted(corners, key=lambda x: (x[1], x[0]))
+
+                top_two = corners[:2]
+                bottom_two = corners[2:]
+
+                top_left, top_right = sorted(top_two, key=lambda x: x[0])
+                bottom_left, bottom_right = sorted(bottom_two, key=lambda x: x[0])
+
+                corners = np.array([top_left, top_right, bottom_right, bottom_left])
+
+            all_corners.append(corners)
+        
+    
+        return all_corners      # list of np.array of int
+    
 
     def __triangulate_gate(self, prev_sensor, prev_center, curr_sensor, curr_center):
 
@@ -341,7 +372,7 @@ class GateTracker:
         y     = position[1] - CY
         theta = np.arctan2(y, x)    # angle from center of world frame
 
-        return (np.rad2deg(theta) > self.gate_index*60 - 150 and np.rad2deg(theta) < (self.gate_index + 1)*60 - 150)
+        return (np.rad2deg(theta) > self.gate_index*60 - 140 and np.rad2deg(theta) < (self.gate_index + 1)*60 - 160)
 
 
 ####################################
